@@ -34,3 +34,27 @@ func coordinatorSock() string {
 	s += strconv.Itoa(os.Getuid())
 	return s
 }
+
+
+// my job args and reply
+
+type JobArgs struct {
+	JobType int
+
+	// map :
+	Filename string
+
+	// reduce :
+	NReduce int
+}
+
+type JobReply struct {
+	JobType int
+
+	// map :
+	Filename string
+	FileNo_  int
+
+	// reduce :
+	NReduce int
+}
