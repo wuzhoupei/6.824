@@ -41,12 +41,13 @@ const (
 	// electionEach     = 10
 	// appendTime       = 150
 	// rpcCheckEach     = 75
+	
 	electionWaitTime = 200
 	electionLen      = 150
 	electionTime     = 150
 	electionEach     = 10
-	appendTime       = 50
-	rpcCheckEach     = 25
+	appendTime       = 15
+	rpcCheckEach     = 10
 )
 
 
@@ -146,7 +147,7 @@ func (rf *Raft) beLeader() {
 	lLen := len(rf.logs) + rf.baseIndex
 	for i := 0; i < pLen; i ++ {
 		rf.nextIndex[i] = lLen 
-		rf.matchIndex[i] = 0
+		rf.matchIndex[i] = rf.baseIndex
 	}
 	rf.persist()
 	DPrintf("%v be leader.", rf.me)
@@ -212,6 +213,7 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&bTerm) != nil {
 		// log.
 	} else {
+		rf.mu.Lock()
 		rf.currentTerm = term
 		rf.votedFor = votedfor
 		rf.logs = logs
@@ -219,6 +221,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commandIndex = bIndex
 		rf.baseIndex = bIndex
 		rf.baseTerm = bTerm
+		rf.mu.Unlock()
 	}
 }
 
@@ -249,6 +252,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	}
 
 	if len(rf.logs) + rf.baseIndex <= lastIncludedIndex || 
+		rf.baseIndex > lastIncludedIndex || 
 		rf.logs[lastIncludedIndex-rf.baseIndex].Term != lastIncludedTerm {
 		rf.logs = append(make([]LogNodes,0), LogNodes{Term : lastIncludedTerm})
 		// DPrintf("%v logs : %v",rf.me,rf.logs)
@@ -288,8 +292,56 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.baseIndex = index
 	rf.saveStateAndSnapshot()
 	rf.mu.Unlock()
+	rf.GiveSnapshot(-1)
 }
 
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) GetDataSnapshot() []byte {
+	return rf.persister.ReadSnapshot()
+}
+
+func (rf *Raft) GiveSnapshot(x int) {
+	pLen := len(rf.peers)
+	for i := 0; i < pLen; i ++ {
+		if i == rf.me {
+			continue 
+		}
+
+		if x != -1 {
+			i = x;
+		}
+
+		go func (e0,e1,e2,e3,e4 int, e5 []byte) {
+			args := SnapshotArgs{e1,e2,e3,e4,e5}
+			ok := false
+			d, _ := time.ParseDuration(strconv.Itoa(appendTime) + "ms")
+			endTime := time.Now().Add(d)
+
+			for ok == false && time.Now().Before(endTime) {
+				reply := SnapshotReply{}
+				ok = rf.sendInstallSnapshot(e0, &args, &reply)
+
+				if ok == true {
+					if reply.Term > args.Term {
+						rf.beFollower()
+					} else {
+						rf.mu.Lock()
+						rf.nextIndex[e0] = e3 + 1
+						rf.matchIndex[e0] = e3
+						rf.mu.Unlock()
+					}
+				}
+			}
+		} (i, rf.currentTerm, rf.me, rf.baseIndex, rf.baseTerm, rf.snapshot)
+		
+		if x != -1 {
+			break 
+		}
+	}
+}
 
 //
 // example RequestVote RPC arguments structure.
@@ -464,11 +516,19 @@ func (rf *Raft) AppendEnteries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		return 
 	}
 
+	if args.PrevLogIndex < rf.baseIndex ||
+		(args.PrevLogIndex == rf.baseIndex && rf.baseTerm != args.PrevLogTerm) {
+		reply.LastIndex = -1
+		reply.Success = false
+		rf.mu.Unlock()
+		return 
+	}
+
 	if rf.logs[args.PrevLogIndex-rf.baseIndex].Term != args.PrevLogTerm {
 		reply.Term = rf.currentTerm 
 		reply.Success = false
 		reply.LastIndex = args.PrevLogIndex
-		for rf.logs[reply.LastIndex-rf.baseIndex].Term == rf.logs[reply.LastIndex-1-rf.baseIndex].Term  {
+		for reply.LastIndex > rf.baseIndex && rf.logs[reply.LastIndex-rf.baseIndex].Term == rf.logs[reply.LastIndex-1-rf.baseIndex].Term  {
 			reply.LastIndex -= 1
 		}
 		rf.mu.Unlock()
@@ -486,6 +546,8 @@ func (rf *Raft) AppendEnteries(args *AppendEntriesArgs, reply *AppendEntriesRepl
 		} else {
 			rf.commandIndex = args.LeaderCommit
 		}
+	} else {
+		rf.commandIndex = args.LeaderCommit
 	}
 	
 	reply.Term = rf.currentTerm 
@@ -583,42 +645,40 @@ func (rf *Raft) appendEnteries() {
 			continue 
 		}
 
+		rf.mu.Lock()
+		if rf.myS != LeaderState {
+			rf.mu.Unlock()
+			break 
+		}
+
+		if rf.nextIndex[i] > lLen {
+			rf.nextIndex[i] = lLen
+			if rf.matchIndex[i] >= lLen {
+				rf.matchIndex[i] = lLen - 1
+			}
+			rf.mu.Unlock()
+			continue 
+		}
+		rf.mu.Unlock()
+
+		rf.mu.Lock()
 		if rf.nextIndex[i] <= rf.baseIndex {
-			go func (e0,e1,e2,e3,e4 int, e5 []byte) {
-				args := SnapshotArgs{e1,e2,e3,e4,e5}
-				reply := SnapshotReply{}
-				ok := false
-				d, _ := time.ParseDuration(strconv.Itoa(appendTime) + "ms")
-				endTime := time.Now().Add(d)
-
-				for ok == false && time.Now().Before(endTime) {
-					ok = rf.sendInstallSnapshot(e0, &args, &reply)
-
-					if ok == true {
-						if reply.Term > args.Term {
-							rf.beFollower()
-						} else {
-							rf.mu.Lock()
-							rf.nextIndex[e0] = e3 + 1
-							rf.matchIndex[e0] = e3
-							rf.mu.Unlock()
-						}
-					}
-				}
-			} (i, rf.currentTerm, rf.me, rf.baseIndex, rf.baseTerm, rf.snapshot)
+			rf.GiveSnapshot(i)
+			rf.mu.Unlock()
 			continue 
 		}
 
 		// DPrintf("+ %v to %v :  %v, %v", rf.me, i, rf.nextIndex[i], rf.baseIndex)
 		logE := rf.logs[rf.nextIndex[i]-rf.baseIndex : lLen-rf.baseIndex]
+		rf.mu.Unlock()
 		go func (e0 int, e1 int, e2 int, e3 int, e4 int, e5 []LogNodes, e6 int) {
 			args := AppendEntriesArgs{e1,e2,e3,e4,e5,e6}
-			reply := AppendEntriesReply{}
 			ok := false
 			d, _ := time.ParseDuration(strconv.Itoa(appendTime) + "ms")
 			endTime := time.Now().Add(d)
 
 			for ok == false && time.Now().Before(endTime) {
+				reply := AppendEntriesReply{}
 				ok = rf.sendAppendEntries(e0, &args, &reply)
 				// k -- 
 
@@ -637,7 +697,7 @@ func (rf *Raft) appendEnteries() {
 						rf.mu.Unlock()
 					} else {
 						if args.Term < reply.Term {
-							// DPrintf("go back")
+							DPrintf("go back")
 							rf.beFollower()
 							// rf.mu.Lock()
 							// rf.currentTerm = reply.Term
@@ -645,15 +705,18 @@ func (rf *Raft) appendEnteries() {
 							break 
 						}
 						rf.mu.Lock()
+						if reply.LastIndex == -1 {
+							reply.LastIndex = rf.baseIndex
+						}
 						// DPrintf("%v is wrong rpc ; %v - > %v\n",e0, rf.nextIndex[e0], reply.LastIndex)
 						rf.nextIndex[e0] = reply.LastIndex
-						if rf.nextIndex[e0] <= rf.baseIndex {
+						if rf.myS != LeaderState || rf.nextIndex[e0] <= rf.baseIndex {
 							rf.mu.Unlock()
 							break 
 						}
 						// DPrintf("- %v to %v :  %v, %v", rf.me, e0, rf.nextIndex[e0], rf.baseIndex)
 						logE = rf.logs[rf.nextIndex[e0]-rf.baseIndex : lLen-rf.baseIndex]
-						args = AppendEntriesArgs{rf.currentTerm, rf.me, rf.nextIndex[e0]-1, rf.logs[rf.nextIndex[e0]-1-rf.baseIndex].Term, logE, rf.commandIndex}
+						args = AppendEntriesArgs{e1, e2, rf.nextIndex[e0]-1, rf.logs[rf.nextIndex[e0]-1-rf.baseIndex].Term, logE, e6}
 						// e1,e2,e3,e4,e5,e6 = rf.currentTerm, rf.me, rf.nextIndex[e0]-1, rf.logs[rf.nextIndex[e0]-1].Term, logE, rf.commandIndex
 						rf.mu.Unlock()
 						ok = false
@@ -665,9 +728,9 @@ func (rf *Raft) appendEnteries() {
 }
 
 func (rf *Raft) UpdataIndex() {
-	time.Sleep(time.Duration(appendTime/10*9) * time.Millisecond)
-	d, _ := time.ParseDuration(strconv.Itoa(appendTime/10) + "ms")
-	endTime := time.Now().Add(d)
+	// time.Sleep(time.Duration(appendTime/10*8) * time.Millisecond)
+	// d, _ := time.ParseDuration(strconv.Itoa(appendTime/10) + "ms")
+	// endTime := time.Now().Add(d)
 	
 	pLen := len(rf.peers)
 	arr := make([]int, pLen)
@@ -680,11 +743,13 @@ func (rf *Raft) UpdataIndex() {
 	sort.Ints(arr)
 	N := arr[pLen / 2]
 	// DPrintf("N : %v; %d ",N, pLen)
+	rf.mu.Lock()
 	if N < rf.baseIndex {
+		// rf.GiveSnapshot(-1)
+		rf.mu.Unlock()
 		return 
 	}
-	rf.mu.Lock()
-	if rf.logs[N-rf.baseIndex].Term == rf.currentTerm && time.Now().Before(endTime) {
+	if rf.myS == LeaderState && rf.logs[N-rf.baseIndex].Term == rf.currentTerm {
 		rf.commandIndex = N
 	}
 	rf.mu.Unlock()
@@ -711,7 +776,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	term, isLeader = rf.GetState()
-	if isLeader {
+	// DPrintf("ser: %v , %v %v %v", rf.me,term, isLeader, rf.myS)
+	if isLeader == true {
 		// DPrintf("%v in log :  %v",rf.me, LogNodes{rf.currentTerm, command})
 		rf.mu.Lock()
 		lLen := len(rf.logs) + rf.baseIndex
@@ -776,7 +842,7 @@ func (rf *Raft) ticker() {
 			continue 
 		}
 
-		// DPrintf("%v try leader: term : %v; logs: %v -> %v",rf.me, rf.currentTerm, len(rf.logs), rf.logs[len(rf.logs)-1])
+		DPrintf("%v try leader: term : %v; logs: %v -> %v",rf.me, rf.currentTerm, len(rf.logs), rf.logs[len(rf.logs)-1])
 		rf.beCandidate()
 
 		vG := aCounter{}
@@ -827,7 +893,7 @@ func (rf *Raft) ticker() {
 			vG.mu.Lock()
 			if vG.cnt > pLen / 2 {
 				rf.beLeader()
-				// DPrintf("%d is leader | %v -> %v\n", rf.me, vG.cnt, pLen/2)
+				DPrintf("%d is leader | %v -> %v\n", rf.me, vG.cnt, pLen/2)
 				vG.mu.Unlock()
 				break 
 			}
@@ -859,8 +925,8 @@ func (rf *Raft) ticker() {
 
 			rf.appendEnteries()
 
-			go rf.UpdataIndex()
 			time.Sleep(time.Duration(appendTime) * time.Millisecond)
+			go rf.UpdataIndex()
 		}
 
 		// DPrintf("%v cycle\n",rf.me)
@@ -874,7 +940,7 @@ func (rf *Raft) BackInterFace() {
 		rf.mu.Lock()
 		if rf.lastApplied < rf.commandIndex {
 			ok = true
-			// DPrintf("%v",rf.me)
+			// DPrintf("%v leader : %v; %v ~ %v; len : %v",rf.me, rf.myS, rf.lastApplied, rf.commandIndex, len(rf.logs)-1)
 			for i := rf.lastApplied + 1; i <= rf.commandIndex; i ++ {
 				prepareLog = append(prepareLog, ApplyMsg{true, rf.logs[i - rf.baseIndex].Log, i, false, nil, 0, 0})
 			}

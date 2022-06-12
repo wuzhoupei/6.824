@@ -7,6 +7,8 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+	"bytes"
 )
 
 const Debug = false
@@ -20,9 +22,43 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 
 type Op struct {
+	Opt       string
+	Key       string
+	Value     string
+	ClientId  int64
+	RequestId int
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+}
+
+type KVdb struct {
+	mu  sync.Mutex
+	kvp map[string]string
+}
+
+func (kvdb *KVdb) Get(Key string) string {
+	kvdb.mu.Lock()
+	Value, ok := kvdb.kvp[Key]
+	if ok == false {
+		Value = ""
+	}
+	kvdb.mu.Unlock()
+	return Value
+}
+
+func (kvdb *KVdb) Put(Key, Value string) {
+	kvdb.mu.Lock()
+	kvdb.kvp[Key] = Value
+	kvdb.mu.Unlock()
+}
+
+func (kvdb *KVdb) Append(Key, Value string) {
+	// oldV := kvdb.Get(Key)
+	// kvdb.Put(Key, oldV + Value)
+	kvdb.mu.Lock()
+	kvdb.kvp[Key] += Value
+	kvdb.mu.Unlock()
 }
 
 type KVServer struct {
@@ -32,18 +68,229 @@ type KVServer struct {
 	applyCh chan raft.ApplyMsg
 	dead    int32 // set by Kill()
 
+	DB KVdb
+	doneLog map[int64]int
+	backChan map[int]chan Op
+
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
 }
 
 
+func (kv *KVServer) CloseChan(index int) {
+	kv.mu.Lock()
+	ch, have := kv.backChan[index]
+	if have == true {
+		close(ch)
+		delete(kv.backChan, index)
+	}
+	kv.mu.Unlock()
+}
+
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	opt := Op {
+		Opt : GetOpt,
+		Key : args.Key,
+		ClientId : args.ClientId,
+		RequestId : args.RequestId,
+	}
+
+	kv.mu.Lock()
+	index,_,isLeader := kv.rf.Start(opt)
+	kv.mu.Unlock()
+
+	if isLeader == false {
+		reply.Err = "ErrWrongLeader"
+		// DPrintf("ser %v this last logs is : %v", kv.me, kv.rf.GetRaftStateSize())
+		// DPrintf("%v not leader", kv.me)
+		return 
+	}
+	// DPrintf("%v %v %v\n op: %v in %v,", kv.me, "is leader > ", isLeader, opt, kv.me)
+	// kv.CheckLogsLen(index)
+
+	kv.mu.Lock()
+	ch, have := kv.backChan[index]
+	if have == false {
+		ch = make(chan Op, 1)
+		kv.backChan[index] = ch
+	}
+	kv.mu.Unlock()
+
+	select {
+	case x := <- ch :
+		// DPrintf("GET + %v \n %v, in %v", x,opt, kv.me)
+		if x.Opt != GetOpt || x.Key != opt.Key || x.ClientId != opt.ClientId || x.RequestId != opt.RequestId {
+			reply.Err = ErrWrongLeader
+			// DPrintf("this")
+			kv.CloseChan(index)
+			return 
+		}
+		
+		reply.Err = OK
+		reply.Value = x.Value
+		kv.CloseChan(index)
+		return 
+	case <- time.After(TimeOut * time.Millisecond) :
+		reply.Err = ErrTimeOut
+		kv.CloseChan(index)
+		return 
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	opt := Op {
+		Opt : args.Op,
+		Key : args.Key,
+		Value : args.Value,
+		ClientId : args.ClientId,
+		RequestId : args.RequestId,
+	}
+
+	kv.mu.Lock()
+	index,_,isLeader := kv.rf.Start(opt)
+	kv.mu.Unlock()
+
+	if isLeader == false {
+		// DPrintf("%v wrong in %v",index, term)
+	// DPrintf("ser %v this last logs is : %v", kv.me, kv.rf.GetRaftStateSize())
+		reply.Err = ErrWrongLeader
+		return 
+	}
+
+	// kv.CheckLogsLen(index)
+
+	kv.mu.Lock()
+	ch, have := kv.backChan[index]
+	if have == false {
+		ch = make(chan Op, 1)
+		kv.backChan[index] = ch
+	}
+	kv.mu.Unlock()
+
+	select {
+	case x := <- ch :
+		// DPrintf("%v \n %v", x,opt)
+		if x.Opt != opt.Opt || x.Key != opt.Key || x.Value != opt.Value || x.ClientId != opt.ClientId || x.RequestId != opt.RequestId {
+			reply.Err = ErrWrongLeader
+			kv.CloseChan(index)
+			return 
+		}
+		
+		reply.Err = OK
+		kv.CloseChan(index)
+		return 
+	case <- time.After(TimeOut * time.Millisecond) :
+		reply.Err = ErrTimeOut
+		kv.CloseChan(index)
+		return 
+	}
+}
+
+func (kv *KVServer) LiveApply() {
+	for {
+		// DPrintf("Start!")
+		select {
+		case backAM := <- kv.applyCh :
+			if backAM.CommandValid == true {
+				opt := backAM.Command.(Op)
+				kv.mu.Lock()
+				x,ok := kv.doneLog[opt.ClientId]
+				if ok == true && x >= opt.RequestId {
+					kv.mu.Unlock()
+					if opt.Opt == GetOpt {
+						opt.Value = kv.DB.Get(opt.Key)
+					}
+					// continue 
+				} else {
+					kv.doneLog[opt.ClientId] = opt.RequestId
+					kv.mu.Unlock()
+
+					if opt.Opt == GetOpt {
+						opt.Value = kv.DB.Get(opt.Key)
+					}
+					if opt.Opt == PutOpt {
+						kv.DB.Put(opt.Key, opt.Value)
+					}
+					if opt.Opt == AppendOpt {
+						kv.DB.Append(opt.Key, opt.Value)
+					}
+				}
+
+				kv.mu.Lock()
+				_,isLeader := kv.rf.GetState()
+				if isLeader == true {
+					// DPrintf("liveapply leader : %v", kv.me)
+					ch, have := kv.backChan[backAM.CommandIndex]
+					if have == true {
+						ch <- opt
+					}
+					kv.CheckLogsLen(backAM.CommandIndex)
+					// DPrintf("doing %v",opt)
+				}
+				kv.mu.Unlock()
+			} else if backAM.SnapshotValid == true {
+				// snapshot := backAM.Snapshot
+				kv.mu.Lock()
+				ok := kv.rf.CondInstallSnapshot(
+						backAM.SnapshotTerm, backAM.SnapshotIndex, backAM.Snapshot)
+				
+				if ok == true {
+					data := backAM.Snapshot
+					r := bytes.NewBuffer(data)
+					d := labgob.NewDecoder(r)
+					var kvMap map[string]string
+					var crMap map[int64]int
+					if d.Decode(&kvMap) != nil || 
+						d.Decode(&crMap) != nil {
+							// log.
+					} else {
+						kv.DB.mu.Lock()
+						kv.DB.kvp = kvMap
+						kv.DB.mu.Unlock()
+						kv.doneLog = crMap
+					}
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
+}
+
+func (kv *KVServer) CheckLogsLen(index int) {
+	if kv.maxraftstate == -1  || kv.maxraftstate > kv.rf.GetRaftStateSize() {
+		return 
+	}
+
+	// kv.mu.Lock() 
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.DB.kvp)
+	e.Encode(kv.doneLog)
+	data := w.Bytes()
+	kv.rf.Snapshot(index, data)
+	// kv.mu.Unlock()
+	// DPrintf("snapshot from %v, and last logs : %v",index, kv.rf.GetRaftStateSize())
+}
+
+func (kv *KVServer) ReadKVSnapshot(data []byte) {
+	if data == nil || len(data) < 1 {
+		return 
+	}
+	
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvMap map[string]string
+	var crMap map[int64]int
+	if d.Decode(&kvMap) != nil || 
+		d.Decode(&crMap) != nil {
+			// log.
+	} else {
+		kv.DB.mu.Lock()
+		kv.DB.kvp = kvMap
+		kv.DB.mu.Unlock()
+		kv.doneLog = crMap
+	}
 }
 
 //
@@ -90,11 +337,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
+	kv.DB = KVdb{}
+	kv.DB.kvp = make(map[string]string)
+	kv.doneLog = make(map[int64]int)
+	kv.backChan = make(map[int]chan Op)
+
+	kv.ReadKVSnapshot(persister.ReadSnapshot())
+
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	go kv.LiveApply()
 	// You may need initialization code here.
 
 	return kv
