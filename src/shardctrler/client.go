@@ -8,10 +8,15 @@ import "6.824/labrpc"
 import "time"
 import "crypto/rand"
 import "math/big"
+import "sync"
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	mu sync.Mutex
+	clientId  int64
+	requestId int
+	leaderId  int
 }
 
 func nrand() int64 {
@@ -25,6 +30,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.clientId = nrand()
+	ck.requestId = 0
+	ck.leaderId = 0
 	return ck
 }
 
@@ -48,6 +56,9 @@ func (ck *Clerk) Query(num int) Config {
 func (ck *Clerk) Join(servers map[int][]string) {
 	args := &JoinArgs{}
 	// Your code here.
+	ck.requestId += 1
+	args.Cid = ck.clientId
+	args.Rid = ck.requestId
 	args.Servers = servers
 
 	for {
@@ -66,6 +77,9 @@ func (ck *Clerk) Join(servers map[int][]string) {
 func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.
+	ck.requestId += 1
+	args.Cid = ck.clientId
+	args.Rid = ck.requestId
 	args.GIDs = gids
 
 	for {
@@ -84,6 +98,9 @@ func (ck *Clerk) Leave(gids []int) {
 func (ck *Clerk) Move(shard int, gid int) {
 	args := &MoveArgs{}
 	// Your code here.
+	ck.requestId += 1
+	args.Cid = ck.clientId
+	args.Rid = ck.requestId
 	args.Shard = shard
 	args.GID = gid
 
